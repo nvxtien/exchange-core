@@ -8,7 +8,14 @@ This file starts tracking from the journalling/recovery work below rather than
 reconstructing the fork's full prior history; earlier changes remain available
 via `git log`.
 
-## [Unreleased]
+This is the `emporia-core` branch: the fifteen commits this section originally
+described (see [master](https://github.com/nvxtien/exchange-core/tree/master)
+for those individually) are squashed here into
+[2e2aa67](https://github.com/nvxtien/exchange-core/commit/2e2aa67), so the
+commit links below point there rather than to SHAs no longer reachable from
+this branch's own history.
+
+## [0.5.4-ec]
 
 Work toward making journalled (write-ahead log) recovery safe to enable,
 verified by a `kill -9` test against a running order-management-service rather
@@ -24,7 +31,7 @@ than by unit tests alone.
   everything accepted since the first recovery, with nothing indicating it.
   The boundary is now the count of commands actually replayed through the API,
   in the current process's own sequence space.
-  ([9ca7099](https://github.com/nvxtien/exchange-core/commit/9ca7099))
+  ([2e2aa67](https://github.com/nvxtien/exchange-core/commit/2e2aa67))
 
 - **`shutdown()` no longer hangs when nothing was journalled.** The
   `SHUTDOWN_SIGNAL` branch of `writeToJournal` called `flushBufferSync` before
@@ -34,7 +41,7 @@ than by unit tests alone.
   `ExchangeCore.shutdown()` threw `IllegalStateException: could not stop a
   disruptor gracefully` after its 5-second timeout. Fixed with an explicit
   guard: if nothing has been journalled yet, there is nothing to flush.
-  ([9ca7099](https://github.com/nvxtien/exchange-core/commit/9ca7099))
+  ([2e2aa67](https://github.com/nvxtien/exchange-core/commit/2e2aa67))
 
 - **Journal file names no longer collide after recovery.** Journal files are
   named `<exchange>_journal_<snapshotId>_<counter>`, and `filesCounter`
@@ -46,7 +53,7 @@ than by unit tests alone.
   first free one. (Note: an immediate post-recovery snapshot does not work
   around this — the snapshot command is itself mutating and hits the same
   lazy-open path first.)
-  ([c58854d](https://github.com/nvxtien/exchange-core/commit/c58854d))
+  ([2e2aa67](https://github.com/nvxtien/exchange-core/commit/2e2aa67))
 
 ### Added
 
@@ -59,7 +66,7 @@ than by unit tests alone.
   the disruptor directly, so without this a journalled recovery leaves the
   book holding orders the lifecycle layer has no record of, and every later
   operation on them fails with `unknown lifecycle order`.
-  ([c58854d](https://github.com/nvxtien/exchange-core/commit/c58854d))
+  ([2e2aa67](https://github.com/nvxtien/exchange-core/commit/2e2aa67))
 
 - **Journalling is now configurable** via
   `ProductionSimulationConfiguration.journalingEnabled` (default `false`).
@@ -70,11 +77,11 @@ than by unit tests alone.
   uses `lastKnownStateFromJournal(...)`, so replay picks up commands accepted
   after the last snapshot instead of discarding them the way
   `fromSnapshotOnly(...)` does.
-  ([0752bb5](https://github.com/nvxtien/exchange-core/commit/0752bb5))
+  ([2e2aa67](https://github.com/nvxtien/exchange-core/commit/2e2aa67))
 
 - The exchange-core storage/snapshot/journal folder is now created before the
   first snapshot write, rather than assuming it exists.
-  ([1408fc7](https://github.com/nvxtien/exchange-core/commit/1408fc7))
+  ([2e2aa67](https://github.com/nvxtien/exchange-core/commit/2e2aa67))
 
 ### Verified
 
