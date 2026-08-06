@@ -79,6 +79,7 @@ public final class RiskEngine implements WriteBytesMarshallable {
     private final Path folder;
 
     private final boolean cfgIgnoreRiskProcessing;
+    private final boolean cfgMatchingOnly;
     private final boolean cfgMarginTradingEnabled;
 
     private final ISerializationProcessor serializationProcessor;
@@ -173,7 +174,9 @@ public final class RiskEngine implements WriteBytesMarshallable {
         }
 
         final OrdersProcessingConfiguration ordersProcCfg = exchangeConfiguration.getOrdersProcessingCfg();
-        this.cfgIgnoreRiskProcessing = ordersProcCfg.getRiskProcessingMode() == OrdersProcessingConfiguration.RiskProcessingMode.NO_RISK_PROCESSING;
+        final OrdersProcessingConfiguration.RiskProcessingMode riskProcessingMode = ordersProcCfg.getRiskProcessingMode();
+        this.cfgIgnoreRiskProcessing = riskProcessingMode.bypassesRiskChecks();
+        this.cfgMatchingOnly = riskProcessingMode.isMatchingOnly();
         this.cfgMarginTradingEnabled = ordersProcCfg.getMarginTradingMode() == OrdersProcessingConfiguration.MarginTradingMode.MARGIN_TRADING_ENABLED;
     }
 
@@ -235,6 +238,14 @@ public final class RiskEngine implements WriteBytesMarshallable {
             case CANCEL_ORDER:
             case REDUCE_ORDER:
             case ORDER_BOOK_REQUEST:
+                return false;
+
+            case REPLACE_ORDER:
+                if (shardId == 0) {
+                    cmd.resultCode = cfgMatchingOnly
+                            ? CommandResultCode.VALID_FOR_MATCHING_ENGINE
+                            : CommandResultCode.MATCHING_UNSUPPORTED_COMMAND;
+                }
                 return false;
 
             case PLACE_ORDER:
@@ -327,7 +338,7 @@ public final class RiskEngine implements WriteBytesMarshallable {
 
             final IntObjectHashMap<CoreSymbolSpecification> symbols = ((BatchAddSymbolsCommand) message).getSymbols();
             symbols.forEach(spec -> {
-                if (spec.type == SymbolType.CURRENCY_EXCHANGE_PAIR || cfgMarginTradingEnabled) {
+                if (spec.type.isCashMarket() || cfgMarginTradingEnabled) {
                     symbolSpecificationProvider.addSymbol(spec);
                 } else {
                     log.warn("Margin symbols are not allowed: {}", spec);
@@ -356,6 +367,12 @@ public final class RiskEngine implements WriteBytesMarshallable {
     }
 
     private CommandResultCode placeOrderRiskCheck(final OrderCommand cmd) {
+
+        if (cfgMatchingOnly) {
+            return symbolSpecificationProvider.getSymbolSpecification(cmd.symbol) == null
+                    ? CommandResultCode.INVALID_SYMBOL
+                    : CommandResultCode.VALID_FOR_MATCHING_ENGINE;
+        }
 
         final UserProfile userProfile = userProfileService.getUserProfile(cmd.uid);
         if (userProfile == null) {
@@ -393,7 +410,7 @@ public final class RiskEngine implements WriteBytesMarshallable {
                                          final CoreSymbolSpecification spec) {
 
 
-        if (spec.type == SymbolType.CURRENCY_EXCHANGE_PAIR) {
+        if (spec.type.isCashMarket()) {
 
             return placeExchangeOrder(cmd, userProfile, spec);
 
@@ -557,6 +574,10 @@ public final class RiskEngine implements WriteBytesMarshallable {
 
     public boolean handlerRiskRelease(final long seq, final OrderCommand cmd) {
 
+        if (cfgMatchingOnly) {
+            return false;
+        }
+
         final int symbol = cmd.symbol;
 
         final L2MarketData marketData = cmd.marketData;
@@ -577,7 +598,7 @@ public final class RiskEngine implements WriteBytesMarshallable {
         if (mte != null && mte.eventType != MatcherEventType.BINARY_EVENT) {
             // at least one event to process, resolving primary/taker user profile
             // TODO processing order is reversed
-            if (spec.type == SymbolType.CURRENCY_EXCHANGE_PAIR) {
+            if (spec.type.isCashMarket()) {
 
                 final UserProfile takerUp = uidForThisHandler(cmd.uid)
                         ? userProfileService.getUserProfileOrAddSuspended(cmd.uid)

@@ -17,7 +17,6 @@ package exchange.core2.core.processors;
 
 import exchange.core2.collections.objpool.ObjectsPool;
 import exchange.core2.core.common.CoreSymbolSpecification;
-import exchange.core2.core.common.SymbolType;
 import exchange.core2.core.common.api.binary.BatchAddAccountsCommand;
 import exchange.core2.core.common.api.binary.BatchAddSymbolsCommand;
 import exchange.core2.core.common.api.reports.ReportQuery;
@@ -173,6 +172,7 @@ public final class MatchingEngineRouter implements WriteBytesMarshallable {
         final OrderCommandType command = cmd.command;
 
         if (command == OrderCommandType.MOVE_ORDER
+                || command == OrderCommandType.REPLACE_ORDER
                 || command == OrderCommandType.CANCEL_ORDER
                 || command == OrderCommandType.PLACE_ORDER
                 || command == OrderCommandType.REDUCE_ORDER
@@ -239,7 +239,7 @@ public final class MatchingEngineRouter implements WriteBytesMarshallable {
 
 //        log.debug("ME add symbolSpecification: {}", symbolSpecification);
 
-        if (spec.type != SymbolType.CURRENCY_EXCHANGE_PAIR && !cfgMarginTradingEnabled) {
+        if (!spec.type.isCashMarket() && !cfgMarginTradingEnabled) {
             log.warn("Margin symbols are not allowed: {}", spec);
         }
 

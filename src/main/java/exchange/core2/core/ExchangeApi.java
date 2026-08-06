@@ -23,16 +23,23 @@ import exchange.core2.core.common.OrderAction;
 import exchange.core2.core.common.OrderType;
 import exchange.core2.core.common.api.*;
 import exchange.core2.core.common.api.binary.BinaryDataCommand;
+import exchange.core2.core.common.api.dma.DmaCancelOrder;
+import exchange.core2.core.common.api.dma.DmaLifecycleSnapshot;
+import exchange.core2.core.common.api.dma.DmaLimitOrder;
+import exchange.core2.core.common.api.dma.DmaOrderResult;
+import exchange.core2.core.common.api.dma.DmaProtectedMarketOrder;
+import exchange.core2.core.common.api.dma.DmaReplaceOrder;
 import exchange.core2.core.common.api.reports.ApiReportQuery;
 import exchange.core2.core.common.api.reports.ReportQuery;
 import exchange.core2.core.common.api.reports.ReportResult;
 import exchange.core2.core.common.cmd.CommandResultCode;
 import exchange.core2.core.common.cmd.OrderCommand;
 import exchange.core2.core.common.cmd.OrderCommandType;
+import exchange.core2.core.common.config.OrdersProcessingConfiguration;
+import exchange.core2.core.dma.DmaOrderLifecycleService;
 import exchange.core2.core.orderbook.OrderBookEventsHelper;
 import exchange.core2.core.processors.BinaryCommandsProcessor;
 import exchange.core2.core.utils.SerializationUtils;
-import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
 import net.jpountz.lz4.LZ4Compressor;
 import net.openhft.chronicle.bytes.WriteBytesMarshallable;
@@ -42,6 +49,7 @@ import org.eclipse.collections.impl.map.mutable.ConcurrentHashMap;
 
 import java.util.List;
 import java.util.Map;
+import java.util.Objects;
 import java.util.concurrent.CompletableFuture;
 import java.util.function.Consumer;
 import java.util.function.Function;
@@ -49,17 +57,39 @@ import java.util.function.LongConsumer;
 import java.util.stream.Stream;
 
 @Slf4j
-@RequiredArgsConstructor
 public final class ExchangeApi {
 
     private final RingBuffer<OrderCommand> ringBuffer;
     private final LZ4Compressor lz4Compressor;
+    private final OrdersProcessingConfiguration.RiskProcessingMode riskProcessingMode;
+    private volatile DmaOrderLifecycleService dmaOrderLifecycleService;
 
     // promises cache (TODO can be changed to queue)
     private final Map<Long, Consumer<OrderCommand>> promises = new ConcurrentHashMap<>();
 
     public static final int LONGS_PER_MESSAGE = 5;
 
+    /**
+     * Creates the standard risk-managed API.
+     */
+    public ExchangeApi(final RingBuffer<OrderCommand> ringBuffer,
+                       final LZ4Compressor lz4Compressor) {
+        this(
+                ringBuffer,
+                lz4Compressor,
+                OrdersProcessingConfiguration.RiskProcessingMode.FULL_PER_CURRENCY);
+    }
+
+    public ExchangeApi(final RingBuffer<OrderCommand> ringBuffer,
+                       final LZ4Compressor lz4Compressor,
+                       final OrdersProcessingConfiguration.RiskProcessingMode riskProcessingMode) {
+        this.ringBuffer = Objects.requireNonNull(ringBuffer, "ringBuffer");
+        this.lz4Compressor = Objects.requireNonNull(lz4Compressor, "lz4Compressor");
+        this.riskProcessingMode = Objects.requireNonNull(riskProcessingMode, "riskProcessingMode");
+        this.dmaOrderLifecycleService = supportsDmaLifecycle(riskProcessingMode)
+                ? new DmaOrderLifecycleService(this)
+                : null;
+    }
 
     public void processResult(final long seq, final OrderCommand cmd) {
 
@@ -77,6 +107,9 @@ public final class ExchangeApi {
 
         if (cmd instanceof ApiMoveOrder) {
             ringBuffer.publishEvent(MOVE_ORDER_TRANSLATOR, (ApiMoveOrder) cmd);
+        } else if (cmd instanceof ApiReplaceOrder) {
+            requireMatchingOnly();
+            ringBuffer.publishEvent(REPLACE_ORDER_TRANSLATOR, (ApiReplaceOrder) cmd);
         } else if (cmd instanceof ApiPlaceOrder) {
             ringBuffer.publishEvent(NEW_ORDER_TRANSLATOR, (ApiPlaceOrder) cmd);
         } else if (cmd instanceof ApiCancelOrder) {
@@ -113,6 +146,9 @@ public final class ExchangeApi {
 
         if (cmd instanceof ApiMoveOrder) {
             return submitCommandAsync(MOVE_ORDER_TRANSLATOR, (ApiMoveOrder) cmd);
+        } else if (cmd instanceof ApiReplaceOrder) {
+            requireMatchingOnly();
+            return submitCommandAsync(REPLACE_ORDER_TRANSLATOR, (ApiReplaceOrder) cmd);
         } else if (cmd instanceof ApiPlaceOrder) {
             return submitCommandAsync(NEW_ORDER_TRANSLATOR, (ApiPlaceOrder) cmd);
         } else if (cmd instanceof ApiCancelOrder) {
@@ -146,6 +182,9 @@ public final class ExchangeApi {
 
         if (cmd instanceof ApiMoveOrder) {
             return submitCommandAsyncFullResponse(MOVE_ORDER_TRANSLATOR, (ApiMoveOrder) cmd);
+        } else if (cmd instanceof ApiReplaceOrder) {
+            requireMatchingOnly();
+            return submitCommandAsyncFullResponse(REPLACE_ORDER_TRANSLATOR, (ApiReplaceOrder) cmd);
         } else if (cmd instanceof ApiPlaceOrder) {
             return submitCommandAsyncFullResponse(NEW_ORDER_TRANSLATOR, (ApiPlaceOrder) cmd);
         } else if (cmd instanceof ApiCancelOrder) {
@@ -171,6 +210,137 @@ public final class ExchangeApi {
         }
     }
 
+    /**
+     * Submits a price-time-priority GTC limit order through the DMA lifecycle.
+     * Both {@code MATCHING_ONLY} and fully risk-managed modes are supported.
+     * The result snapshots fills in matching-engine event order before the
+     * underlying ring-buffer entry can be reused.
+     *
+     * @param order immutable DMA limit-order request
+     * @return immutable command result and ordered fills
+     */
+    public CompletableFuture<DmaOrderResult> submitDmaLimitOrder(final DmaLimitOrder order) {
+        requireDmaLifecycle();
+        Objects.requireNonNull(order, "order");
+
+        final ApiPlaceOrder command = ApiPlaceOrder.builder()
+                .orderId(order.orderId())
+                .uid(order.clientId())
+                .symbol(order.symbol())
+                .action(order.side())
+                .price(order.price())
+                .reservePrice(order.side() == OrderAction.BID ? order.price() : 0L)
+                .size(order.quantity())
+                .orderType(OrderType.GTC)
+                .build();
+
+        return submitCommandAsync(NEW_ORDER_TRANSLATOR, command, DmaOrderResult::from);
+    }
+
+    /**
+     * Submits a marketable IOC order with a hard protection price. Unfilled
+     * quantity is rejected and never rests in the order book.
+     */
+    public CompletableFuture<DmaOrderResult> submitDmaProtectedMarketOrder(
+            final DmaProtectedMarketOrder order) {
+        requireDmaLifecycle();
+        Objects.requireNonNull(order, "order");
+
+        final ApiPlaceOrder command = ApiPlaceOrder.builder()
+                .orderId(order.orderId())
+                .uid(order.clientId())
+                .symbol(order.symbol())
+                .action(order.side())
+                .price(order.protectionPrice())
+                .reservePrice(order.side() == OrderAction.BID ? order.protectionPrice() : 0L)
+                .size(order.quantity())
+                .orderType(OrderType.IOC)
+                .build();
+
+        return submitCommandAsync(NEW_ORDER_TRANSLATOR, command, DmaOrderResult::from);
+    }
+
+    /**
+     * Atomically replaces both price and total quantity of a live DMA order.
+     */
+    public CompletableFuture<DmaOrderResult> replaceDmaOrder(final DmaReplaceOrder replacement) {
+        requireMatchingOnly();
+        Objects.requireNonNull(replacement, "replacement");
+
+        final ApiReplaceOrder command = ApiReplaceOrder.builder()
+                .orderId(replacement.orderId())
+                .uid(replacement.clientId())
+                .symbol(replacement.symbol())
+                .newPrice(replacement.newPrice())
+                .newQuantity(replacement.newQuantity())
+                .newReservePrice(
+                        replacement.side() == OrderAction.BID
+                                ? replacement.newPrice()
+                                : 0L)
+                .side(replacement.side())
+                .build();
+
+        return submitCommandAsync(REPLACE_ORDER_TRANSLATOR, command, DmaOrderResult::from);
+    }
+
+    /**
+     * Cancels the unfilled remainder of a DMA order.
+     *
+     * @param cancel immutable DMA cancellation request
+     * @return immutable result containing the cancelled quantity
+     */
+    public CompletableFuture<DmaOrderResult> cancelDmaOrder(final DmaCancelOrder cancel) {
+        requireDmaLifecycle();
+        Objects.requireNonNull(cancel, "cancel");
+
+        final ApiCancelOrder command = ApiCancelOrder.builder()
+                .orderId(cancel.orderId())
+                .uid(cancel.clientId())
+                .symbol(cancel.symbol())
+                .build();
+
+        return submitCommandAsync(CANCEL_ORDER_TRANSLATOR, command, DmaOrderResult::from);
+    }
+
+    /**
+     * Returns the stateful, idempotent DMA lifecycle boundary for
+     * {@code MATCHING_ONLY} or {@code FULL_PER_CURRENCY}.
+     */
+    public DmaOrderLifecycleService dmaLifecycle() {
+        requireDmaLifecycle();
+        return dmaOrderLifecycleService;
+    }
+
+    /**
+     * Replaces the lifecycle projection with a recovered checkpoint. Matching
+     * engine state must be recovered to the same command boundary separately.
+     */
+    public synchronized DmaOrderLifecycleService recoverDmaLifecycle(
+            final DmaLifecycleSnapshot snapshot) {
+        requireDmaLifecycle();
+        dmaOrderLifecycleService = DmaOrderLifecycleService.recover(this, snapshot);
+        return dmaOrderLifecycleService;
+    }
+
+    private void requireDmaLifecycle() {
+        if (!supportsDmaLifecycle(riskProcessingMode)) {
+            throw new IllegalStateException(
+                    "DMA lifecycle requires MATCHING_ONLY or FULL_PER_CURRENCY");
+        }
+    }
+
+    private static boolean supportsDmaLifecycle(
+            final OrdersProcessingConfiguration.RiskProcessingMode mode) {
+        return mode.isMatchingOnly()
+                || mode == OrdersProcessingConfiguration.RiskProcessingMode
+                        .FULL_PER_CURRENCY;
+    }
+
+    private void requireMatchingOnly() {
+        if (!riskProcessingMode.isMatchingOnly()) {
+            throw new IllegalStateException("DMA order flow requires RiskProcessingMode.MATCHING_ONLY");
+        }
+    }
 
     public void submitCommandsSync(List<? extends ApiCommand> cmd) {
         if (cmd.isEmpty()) {
@@ -271,7 +441,7 @@ public final class ExchangeApi {
                 query,
                 transferId,
                 cmd -> query.createResult(
-                        OrderBookEventsHelper.deserializeEvents(cmd).values().parallelStream().map(Wire::bytes)));
+                        OrderBookEventsHelper.deserializeEvents(cmd).values().stream().map(Wire::bytes)));
     }
 
     public void publishBinaryData(final ApiBinaryDataCommand apiCmd, final LongConsumer endSeqConsumer) {
@@ -448,6 +618,20 @@ public final class ExchangeApi {
         cmd.timestamp = api.timestamp;
         cmd.resultCode = CommandResultCode.NEW;
     };
+
+    private static final EventTranslatorOneArg<OrderCommand, ApiReplaceOrder> REPLACE_ORDER_TRANSLATOR =
+            (cmd, seq, api) -> {
+                cmd.command = OrderCommandType.REPLACE_ORDER;
+                cmd.price = api.newPrice;
+                cmd.reserveBidPrice = api.newReservePrice;
+                cmd.size = api.newQuantity;
+                cmd.orderId = api.orderId;
+                cmd.symbol = api.symbol;
+                cmd.uid = api.uid;
+                cmd.action = api.side;
+                cmd.timestamp = api.timestamp;
+                cmd.resultCode = CommandResultCode.NEW;
+            };
 
     private static final EventTranslatorOneArg<OrderCommand, ApiCancelOrder> CANCEL_ORDER_TRANSLATOR = (cmd, seq, api) -> {
         cmd.command = OrderCommandType.CANCEL_ORDER;
@@ -817,6 +1001,33 @@ public final class ExchangeApi {
             cmd.resultCode = CommandResultCode.NEW;
 
             cmd.price = price;
+            cmd.orderId = orderId;
+            cmd.timestamp = timestampNs;
+            cmd.symbol = symbol;
+            cmd.uid = uid;
+        });
+    }
+
+    public void replaceOrder(int serviceFlags,
+                             long eventsGroup,
+                             long timestampNs,
+                             long price,
+                             long reserveBidPrice,
+                             long quantity,
+                             OrderAction side,
+                             long orderId,
+                             int symbol,
+                             long uid) {
+        requireMatchingOnly();
+        ringBuffer.publishEvent((cmd, seq) -> {
+            cmd.serviceFlags = serviceFlags;
+            cmd.eventsGroup = eventsGroup;
+            cmd.command = OrderCommandType.REPLACE_ORDER;
+            cmd.resultCode = CommandResultCode.NEW;
+            cmd.price = price;
+            cmd.reserveBidPrice = reserveBidPrice;
+            cmd.size = quantity;
+            cmd.action = side;
             cmd.orderId = orderId;
             cmd.timestamp = timestampNs;
             cmd.symbol = symbol;

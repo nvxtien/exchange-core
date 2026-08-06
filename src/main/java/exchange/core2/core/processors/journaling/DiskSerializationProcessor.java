@@ -82,6 +82,8 @@ public final class DiskSerializationProcessor implements ISerializationProcessor
     private FileChannel channel;
 
     private int filesCounter = 0;
+    /** Commands a replay pushed back through the API, in this process's sequence space. */
+    private long replayedCommands;
 
     private long writtenBytes = 0;
 
@@ -98,6 +100,11 @@ public final class DiskSerializationProcessor implements ISerializationProcessor
 
         this.exchangeId = initStateCfg.getExchangeId();
         this.folder = Paths.get(diskConfig.getStorageFolder());
+        try {
+            Files.createDirectories(this.folder);
+        } catch (final IOException ex) {
+            throw new IllegalStateException("Cannot create exchange-core serialization folder: " + this.folder, ex);
+        }
         this.baseSnapshotId = initStateCfg.getSnapshotId();
         this.baseSeq = initStateCfg.getSnapshotBaseSeq();
 
@@ -231,7 +238,7 @@ public final class DiskSerializationProcessor implements ISerializationProcessor
 
         @Override
         public void close() {
-            bytes.release();
+            bytes.releaseLast();
         }
     }
 
@@ -256,6 +263,14 @@ public final class DiskSerializationProcessor implements ISerializationProcessor
         final OrderCommandType cmdType = cmd.command;
 
         if (cmdType == OrderCommandType.SHUTDOWN_SIGNAL) {
+            // Nothing has been journalled yet, so there is no file to flush to.
+            // The channel is opened lazily by the first mutating command below,
+            // and this branch runs before that: without the guard a shutdown
+            // that journalled nothing throws inside the journal handler, the
+            // disruptor never drains, and the exchange fails to stop.
+            if (channel == null) {
+                return;
+            }
             flushBufferSync(false, cmd.timestamp);
             log.debug("Shutdown signal received, flushed to disk");
             return;
@@ -290,6 +305,30 @@ public final class DiskSerializationProcessor implements ISerializationProcessor
             buffer.putLong(cmd.price); // 8 bytes - can be compressed as delta
 
             if (debug) log.debug("move order seq={} t={} orderId={} symbol={} uid={} price={}", baseSeq + dSeq, cmd.timestamp, cmd.orderId, cmd.symbol, cmd.uid, cmd.price);
+
+        } else if (cmdType == OrderCommandType.REPLACE_ORDER) {
+
+            buffer.putLong(cmd.uid);
+            buffer.putInt(cmd.symbol);
+            buffer.putLong(cmd.orderId);
+            buffer.putLong(cmd.price);
+            buffer.putLong(cmd.reserveBidPrice);
+            buffer.putLong(cmd.size);
+            buffer.put(cmd.action.getCode());
+
+            if (debug) {
+                log.debug(
+                        "replace order seq={} t={} orderId={} symbol={} uid={} price={} reserve={} size={} side={}",
+                        baseSeq + dSeq,
+                        cmd.timestamp,
+                        cmd.orderId,
+                        cmd.symbol,
+                        cmd.uid,
+                        cmd.price,
+                        cmd.reserveBidPrice,
+                        cmd.size,
+                        cmd.action);
+            }
 
         } else if (cmdType == OrderCommandType.CANCEL_ORDER) {
 
@@ -411,6 +450,7 @@ public final class DiskSerializationProcessor implements ISerializationProcessor
             return baseSeq;
         }
         log.debug("Replaying journal...");
+        replayedCommands = 0;
 
 //        log.info("Read total: {} bytes ", totalBytesRead);
 
@@ -436,7 +476,24 @@ public final class DiskSerializationProcessor implements ISerializationProcessor
 
             } catch (FileNotFoundException ex) {
                 log.debug("return lastSeq={}, file not found: {}", lastSeq, ex.getMessage());
-                return lastSeq.value;
+                // Continue the journal after the files just replayed, rather
+                // than restarting its numbering. filesCounter is pre-incremented
+                // by startNewFile, so leaving it at zero here made the first
+                // command after a recovery try to create the file it had just
+                // read back, failing with "File already exists" and taking the
+                // journal - and therefore all durability - down with it.
+                //
+                // partitionCounter is the first index with no file, so this
+                // makes the next new file that index. Replay reads indices in
+                // order until one is missing, so a later recovery reads the
+                // pre-recovery files and then these, in the order written.
+                filesCounter = partitionCounter - 1;
+                // The boundary that stops replayed commands being journalled
+                // again has to be in this process's sequence space. dSeq
+                // restarts near 1 here, so comparing it against the previous
+                // process's recorded sequence made every live command after a
+                // recovery look replayed - and silently dropped it.
+                return replayedCommands;
 
             } catch (IOException ex) {
                 partitionCounter++;
@@ -510,6 +567,9 @@ public final class DiskSerializationProcessor implements ISerializationProcessor
                 }
 
                 lastSeq.value = seq;
+                // Counted separately from lastSeq, which holds the sequence the
+                // previous process recorded and only serves gap detection.
+                replayedCommands++;
 
 //                log.debug("command seq={} {}", lastSeq, cmdType);
 
@@ -525,6 +585,42 @@ public final class DiskSerializationProcessor implements ISerializationProcessor
                     if (debug) log.debug("move order seq={} t={} orderId={} symbol={} uid={} price={}", lastSeq, timestampNs, orderId, symbol, uid, price);
 
                     api.moveOrder(serviceFlags, eventsGroup, timestampNs, price, orderId, symbol, uid);
+
+                } else if (cmdType == OrderCommandType.REPLACE_ORDER) {
+
+                    final long uid = jr.readLong();
+                    final int symbol = jr.readInt();
+                    final long orderId = jr.readLong();
+                    final long price = jr.readLong();
+                    final long reserveBidPrice = jr.readLong();
+                    final long quantity = jr.readLong();
+                    final OrderAction side = OrderAction.of(jr.readByte());
+
+                    if (debug) {
+                        log.debug(
+                                "replace order seq={} t={} orderId={} symbol={} uid={} price={} reserve={} size={} side={}",
+                                lastSeq,
+                                timestampNs,
+                                orderId,
+                                symbol,
+                                uid,
+                                price,
+                                reserveBidPrice,
+                                quantity,
+                                side);
+                    }
+
+                    api.replaceOrder(
+                            serviceFlags,
+                            eventsGroup,
+                            timestampNs,
+                            price,
+                            reserveBidPrice,
+                            quantity,
+                            side,
+                            orderId,
+                            symbol,
+                            uid);
 
                 } else if (cmdType == OrderCommandType.CANCEL_ORDER) {
 

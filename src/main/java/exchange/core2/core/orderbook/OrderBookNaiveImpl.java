@@ -394,7 +394,7 @@ public final class OrderBookNaiveImpl implements IOrderBook {
         cmd.action = order.getAction();
 
         // reserved price risk check for exchange bids
-        if (symbolSpec.type == SymbolType.CURRENCY_EXCHANGE_PAIR && order.action == OrderAction.BID && cmd.price > order.reserveBidPrice) {
+        if (symbolSpec.type.isCashMarket() && order.action == OrderAction.BID && cmd.price > order.reserveBidPrice) {
             return CommandResultCode.MATCHING_MOVE_FAILED_PRICE_OVER_RISK_LIMIT;
         }
 
@@ -424,6 +424,50 @@ public final class OrderBookNaiveImpl implements IOrderBook {
         });
         anotherBucket.put(order);
 
+        return CommandResultCode.SUCCESS;
+    }
+
+    @Override
+    public CommandResultCode replaceOrder(final OrderCommand cmd) {
+
+        final Order order = idMap.get(cmd.orderId);
+        if (order == null || order.uid != cmd.uid) {
+            return CommandResultCode.MATCHING_UNKNOWN_ORDER_ID;
+        }
+        if (cmd.action != order.action) {
+            return CommandResultCode.MATCHING_REPLACE_FAILED_DIFFERENT_SIDE;
+        }
+        if (cmd.size <= order.filled) {
+            return CommandResultCode.MATCHING_REPLACE_FAILED_INVALID_QUANTITY;
+        }
+
+        final NavigableMap<Long, OrdersBucketNaive> buckets = getBucketsByAction(order.action);
+        final OrdersBucketNaive originalBucket = buckets.get(order.price);
+        if (originalBucket == null) {
+            throw new IllegalStateException(
+                    "Can not find bucket for order price=" + order.price + " for order " + order);
+        }
+
+        cmd.action = order.getAction();
+        originalBucket.remove(order.orderId, order.uid);
+        if (originalBucket.getTotalVolume() == 0) {
+            buckets.remove(order.price);
+        }
+
+        order.price = cmd.price;
+        order.size = cmd.size;
+        order.reserveBidPrice = cmd.reserveBidPrice;
+
+        final SortedMap<Long, OrdersBucketNaive> matchingArea =
+                subtreeForMatching(order.action, order.price);
+        final long filled = tryMatchInstantly(order, matchingArea, order.filled, cmd);
+        if (filled == order.size) {
+            idMap.remove(order.orderId);
+            return CommandResultCode.SUCCESS;
+        }
+
+        order.filled = filled;
+        buckets.computeIfAbsent(order.price, OrdersBucketNaive::new).put(order);
         return CommandResultCode.SUCCESS;
     }
 
